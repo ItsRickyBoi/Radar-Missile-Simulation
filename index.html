@@ -1,0 +1,948 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>F-15 AESA Radar Sim — Phase 2</title>
+<style>
+  html,body { margin:0; padding:0; overflow:hidden; background:#000; font-family: 'Consolas','Courier New',monospace; }
+  #scene { position:absolute; top:0; left:0; width:100%; height:100%; display:block; }
+  #hud { position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none; }
+  #info {
+    position:absolute; bottom:8px; left:8px; color:#5cff5c; font-size:12px;
+    background:rgba(0,0,0,0.4); padding:6px 10px; border:1px solid rgba(92,255,92,0.3);
+    pointer-events:none; line-height:1.5;
+  }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<canvas id="hud"></canvas>
+<div id="info">
+  W/S: pitch &nbsp; A/D: roll &nbsp; Q/E: rudder &nbsp; SHIFT/CTRL: throttle &nbsp; T: toggle STT lock &nbsp; TAB: cycle target &nbsp; 1: select AIM-7M &nbsp; 2: select AIM-120 &nbsp; SPACE: fire &nbsp; R: rearm
+</div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+/* =========================================================
+   F-15 AESA Radar Sim — Phase 2
+   Adds AIM-7M (SARH, needs continuous STT illumination) and
+   AIM-120 (datalink midcourse -> active terminal seeker) with
+   proportional-navigation guidance state machines.
+   ========================================================= */
+
+// ---------- Renderer / Scene ----------
+const sceneCanvas = document.getElementById('scene');
+const renderer = new THREE.WebGLRenderer({ canvas: sceneCanvas, antialias: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x8fb8d8);
+scene.fog = new THREE.Fog(0x8fb8d8, 4000, 40000);
+
+const camera = new THREE.PerspectiveCamera(55, window.innerWidth/window.innerHeight, 1, 60000);
+
+// Lighting
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(3000, 5000, 2000);
+scene.add(sun);
+scene.add(new THREE.AmbientLight(0x8899aa, 0.6));
+
+// Ground: simple grid plane far below to give altitude/attitude reference
+const groundGeo = new THREE.PlaneGeometry(200000, 200000, 40, 40);
+const groundMat = new THREE.MeshLambertMaterial({ color: 0x3a5f3a, wireframe:false });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI/2;
+ground.position.y = 0;
+scene.add(ground);
+
+// Grid overlay for visual altitude cueing
+const grid = new THREE.GridHelper(200000, 80, 0x264a26, 0x264a26);
+grid.position.y = 1;
+scene.add(grid);
+
+// ---------- Simple placeholder shapes (no detailed 3D models for now) ----------
+function buildPlaceholder(color) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.ConeGeometry(3, 14, 6), new THREE.MeshLambertMaterial({ color }));
+  body.rotation.x = Math.PI/2;
+  g.add(body);
+  const wing = new THREE.Mesh(new THREE.BoxGeometry(14, 0.4, 4), new THREE.MeshLambertMaterial({ color }));
+  g.add(wing);
+  return g;
+}
+
+const ownJetMesh = buildPlaceholder(0xc7cdd4);
+ownJetMesh.visible = false; // first-person view: camera sits at the ownship eyepoint, so no need to render it
+scene.add(ownJetMesh);
+
+// ---------- Flight model (simplified 6DOF-ish, coordinated turns) ----------
+class Aircraft {
+  constructor({ position, heading, speed }) {
+    this.position = position.clone();
+    this.heading = heading;      // radians, 0 = +Z (north-ish in our convention)
+    this.pitch = 0;
+    this.roll = 0;
+    this.speed = speed;          // m/s
+    this.throttle = 0.6;         // 0..1.2 (afterburner headroom)
+    this.maxSpeed = 620;         // ~Mach 1.8 at altitude, simplified
+    this.minSpeed = 90;
+    this.quaternion = new THREE.Quaternion();
+  }
+
+  update(dt, controls) {
+    if (controls) {
+      const pitchRate = 0.9;   // rad/s at full input
+      const rollRate = 2.2;
+      const yawRate = 0.5;     // rudder authority
+
+      this.pitch += controls.pitch * pitchRate * dt;
+      this.roll  += controls.roll  * rollRate  * dt;
+      this.roll  *= 0.98; // slight self-centering damping isn't realistic but keeps it flyable
+      this.pitch = THREE.MathUtils.clamp(this.pitch, -1.3, 1.3);
+      this.roll  = THREE.MathUtils.clamp(this.roll, -1.5, 1.5);
+
+      // Throttle
+      this.throttle += controls.throttle * 0.6 * dt;
+      this.throttle = THREE.MathUtils.clamp(this.throttle, 0, 1.2);
+
+      // Coordinated turn: bank angle drives heading rate (standard flight-sim approximation)
+      const turnRate = Math.sin(this.roll) * 9.81 / Math.max(this.speed, 40) * 1.6;
+      this.heading += turnRate * dt;
+
+      // Rudder adds slow yaw independent of bank (adverse yaw / slip, simplified)
+      this.heading += controls.yaw * yawRate * dt;
+    }
+
+    // Speed approaches throttle-commanded speed (very simplified energy model)
+    const targetSpeed = this.minSpeed + this.throttle * (this.maxSpeed - this.minSpeed) / 1.2;
+    this.speed += (targetSpeed - this.speed) * Math.min(1, dt * 0.4);
+
+    // Orientation quaternion from heading/pitch/roll (yaw-pitch-roll order)
+    const qYaw = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), this.heading);
+    const qPitch = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1,0,0), this.pitch);
+    const qRoll = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), this.roll);
+    this.quaternion.copy(qYaw).multiply(qPitch).multiply(qRoll);
+
+    // Forward vector and integrate position
+    const forward = new THREE.Vector3(0,0,-1).applyQuaternion(this.quaternion);
+    this.position.addScaledVector(forward, this.speed * dt);
+
+    // Floor at ground level (simple)
+    if (this.position.y < 30) this.position.y = 30;
+  }
+}
+
+const ownShip = new Aircraft({ position: new THREE.Vector3(0, 3000, 0), heading: 0, speed: 260 });
+
+// Scripted bandits: each flies a long racetrack pattern with a gentle S-turn.
+// Multiple independent contacts, each respawns individually after being splashed.
+const BANDIT_COUNT = 3;
+const bandits = [];
+function makeBandit(spawnBearing, spawnRange) {
+  const spawnPos = ownShip.position.clone().add(
+    new THREE.Vector3(Math.sin(spawnBearing)*spawnRange, (Math.random()-0.5)*1500, -Math.cos(spawnBearing)*spawnRange)
+  );
+  spawnPos.y = Math.max(spawnPos.y, 1500);
+  const ac = new Aircraft({ position: spawnPos, heading: spawnBearing + Math.PI, speed: 220 + Math.random()*60 });
+  return {
+    aircraft: ac,
+    mesh: buildPlaceholder(0x7a3030),
+    destroyed: false,
+    respawnTimer: 0,
+    scriptT: Math.random()*10,
+    scriptFreq: 0.03 + Math.random()*0.05,
+  };
+}
+for (let i = 0; i < BANDIT_COUNT; i++) {
+  const b = makeBandit((i / BANDIT_COUNT) * Math.PI * 2, 15000 + Math.random()*15000);
+  scene.add(b.mesh);
+  bandits.push(b);
+}
+
+const RESPAWN_DELAY = 5.0;
+function respawnBandit(b) {
+  const bearing = Math.random() * Math.PI * 2;
+  const range = 15000 + Math.random() * 15000;
+  const fresh = makeBandit(bearing, range);
+  b.aircraft = fresh.aircraft;
+  b.scriptT = fresh.scriptT;
+  b.scriptFreq = fresh.scriptFreq;
+  b.destroyed = false;
+  b.mesh.visible = true;
+}
+
+function updateBanditScript(b, dt) {
+  b.scriptT += dt;
+  const turnInput = Math.sin(b.scriptT * b.scriptFreq) * 0.5;
+  b.aircraft.update(dt, { pitch: 0, roll: turnInput, yaw: 0, throttle: 0 });
+}
+
+// ---------- Controls ----------
+const keys = {};
+window.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Digit1') selectedWeapon = 'AIM7M';
+  if (e.code === 'Digit2') selectedWeapon = 'AIM120';
+  if (e.code === 'KeyR') rearm();
+  if (e.code === 'Space') fireWeapon();
+  if (e.code === 'Tab') e.preventDefault();
+});
+window.addEventListener('keyup', e => keys[e.code] = false);
+
+function readControls() {
+  return {
+    pitch: (keys['KeyS'] ? 1 : 0) - (keys['KeyW'] ? 1 : 0),
+    roll:  (keys['KeyD'] ? 1 : 0) - (keys['KeyA'] ? 1 : 0),
+    yaw:   (keys['KeyE'] ? 1 : 0) - (keys['KeyQ'] ? 1 : 0),
+    throttle: (keys['ShiftLeft'] || keys['ShiftRight'] ? 1 : 0) - (keys['ControlLeft'] || keys['ControlRight'] ? 1 : 0),
+  };
+}
+
+// ---------- Radar model (simplified but structurally real) ----------
+const radar = {
+  mode: 'SEARCH',       // SEARCH | TWS | STT
+  azimuthLimit: THREE.MathUtils.degToRad(60),   // AESA gimbal-ish cone, half-angle
+  elevationLimit: THREE.MathUtils.degToRad(60),
+  maxRangeHeadOn: 90000,   // meters, best case (nose-on, high RCS aspect)
+  maxRangeTail: 35000,     // meters, worst case (tail-on, notch-prone)
+  tracks: [],  // { entity, range, azimuth, elevation, aspect, quality, closureRate }
+  lockedTrack: null,
+};
+
+function computeRelative(own, target) {
+  const toTarget = new THREE.Vector3().subVectors(target.position, own.position);
+  const range = toTarget.length();
+  const invQ = own.quaternion.clone().invert();
+  const local = toTarget.clone().applyQuaternion(invQ); // in ownship body frame, -Z forward
+  const azimuth = Math.atan2(local.x, -local.z);
+  const elevation = Math.atan2(local.y, -local.z);
+
+  // Aspect angle: angle between target's nose and the line back to us (0 = closing head-on, 180 = tail-on/away)
+  const toUs = toTarget.clone().negate().normalize();
+  const targetForward = new THREE.Vector3(0,0,-1).applyQuaternion(target.quaternion);
+  const aspect = Math.acos(THREE.MathUtils.clamp(targetForward.dot(toUs.clone().negate()), -1, 1));
+
+  return { range, azimuth, elevation, aspect };
+}
+
+let lockKeyWasDown = false;
+let cycleKeyWasDown = false;
+
+function updateRadar(dt) {
+  radar.tracks = [];
+  bandits.forEach(b => {
+    if (b.destroyed) return;
+    const target = b.aircraft;
+    const rel = computeRelative(ownShip, target);
+    const inGimbal = Math.abs(rel.azimuth) < radar.azimuthLimit && Math.abs(rel.elevation) < radar.elevationLimit;
+
+    // RCS/aspect-based detection range: nose/tail-on aspect gives more/less return.
+    const aspectFactor = 0.4 + 0.6 * Math.abs(Math.cos(rel.aspect));
+    const detectionRange = THREE.MathUtils.lerp(radar.maxRangeTail, radar.maxRangeHeadOn, aspectFactor);
+
+    // Doppler notch: near-zero closure rate makes detection much harder
+    const closureVec = new THREE.Vector3().subVectors(target.position, ownShip.position).normalize();
+    const targetVel = new THREE.Vector3(0,0,-1).applyQuaternion(target.quaternion).multiplyScalar(target.speed);
+    const ownVel = new THREE.Vector3(0,0,-1).applyQuaternion(ownShip.quaternion).multiplyScalar(ownShip.speed);
+    const closureRate = -closureVec.dot(targetVel) + closureVec.dot(ownVel);
+    const notched = Math.abs(closureRate) < 15;
+
+    const detected = inGimbal && rel.range < detectionRange && !notched;
+    if (detected) {
+      radar.tracks.push({ entity: target, bandit: b, ...rel, closureRate, quality: aspectFactor });
+    }
+  });
+
+  // Drop lock if the locked target is no longer a valid track (out of gimbal/range/notched/destroyed)
+  if (radar.lockedTrack) {
+    const stillTracked = radar.tracks.find(t => t.entity === radar.lockedTrack.entity);
+    if (!stillTracked) {
+      radar.lockedTrack = null;
+      radar.mode = radar.tracks.length ? 'TWS' : 'SEARCH';
+    } else {
+      radar.lockedTrack = stillTracked; // refresh with latest geometry
+      radar.mode = 'STT';
+    }
+  } else {
+    radar.mode = radar.tracks.length ? 'TWS' : 'SEARCH';
+  }
+
+  // T: toggle STT lock on/off (press, not hold). Locks the contact nearest boresight within a narrow cone.
+  const lockKeyDown = !!keys['KeyT'];
+  if (lockKeyDown && !lockKeyWasDown) {
+    if (radar.lockedTrack) {
+      radar.lockedTrack = null;
+      radar.mode = radar.tracks.length ? 'TWS' : 'SEARCH';
+    } else {
+      const narrow = radar.tracks.filter(t => Math.abs(t.azimuth) < THREE.MathUtils.degToRad(8) && Math.abs(t.elevation) < THREE.MathUtils.degToRad(8));
+      if (narrow.length) {
+        narrow.sort((a,b) => a.range - b.range);
+        radar.lockedTrack = narrow[0];
+        radar.mode = 'STT';
+      }
+    }
+  }
+  lockKeyWasDown = lockKeyDown;
+
+  // Tab: cycle which contact is locked, among currently detected tracks
+  const cycleKeyDown = !!keys['Tab'];
+  if (cycleKeyDown && !cycleKeyWasDown && radar.tracks.length) {
+    let idx = radar.lockedTrack ? radar.tracks.findIndex(t => t.entity === radar.lockedTrack.entity) : -1;
+    idx = (idx + 1) % radar.tracks.length;
+    radar.lockedTrack = radar.tracks[idx];
+    radar.mode = 'STT';
+  }
+  cycleKeyWasDown = cycleKeyDown;
+}
+
+// ---------- Weapons: AIM-7M (SARH) and AIM-120 (datalink + active) ----------
+const LOADOUT_FULL = { AIM7M: 2, AIM120: 4 };
+const loadout = {
+  AIM7M: { count: LOADOUT_FULL.AIM7M },
+  AIM120: { count: LOADOUT_FULL.AIM120 },
+};
+let selectedWeapon = 'AIM120';
+
+function rearm() {
+  loadout.AIM7M.count = LOADOUT_FULL.AIM7M;
+  loadout.AIM120.count = LOADOUT_FULL.AIM120;
+  feedPush('REARMED — full weapons load', '#5cff5c');
+}
+
+const WEAPON_PARAMS = {
+  AIM7M: {
+    boostTime: 3.0,
+    boostAccel: 260,      // m/s^2 during boost
+    boostSpeedCap: 1300,  // ~Mach 3.5
+    dragDecel: 6,         // m/s^2 sustained bleed after boost
+    navConstant: 3.5,
+    maxG: 40,
+    maxFlightTime: 45,
+    color: 0xffffff,
+  },
+  AIM120: {
+    boostTime: 3.5,
+    boostAccel: 300,
+    boostSpeedCap: 1500,
+    dragDecel: 4,
+    navConstant: 4,
+    maxG: 50,
+    maxFlightTime: 60,
+    pitbullRange: 13000, // active seeker acquisition range
+    color: 0x222222,
+  },
+};
+
+function buildMissileMesh(color) {
+  const g = new THREE.Group();
+  const body = new THREE.Mesh(new THREE.CylinderGeometry(0.4, 0.4, 4.2, 8), new THREE.MeshBasicMaterial({ color }));
+  body.rotation.x = Math.PI/2;
+  g.add(body);
+  const fin = new THREE.Mesh(new THREE.BoxGeometry(1.4, 0.06, 0.7), new THREE.MeshBasicMaterial({ color: 0x888888 }));
+  fin.position.z = 1.6;
+  g.add(fin);
+  // Motor plume: small bright glow at the tail so it's visible against the sky
+  const plume = new THREE.Mesh(new THREE.SphereGeometry(0.5, 6, 6), new THREE.MeshBasicMaterial({ color: 0xffaa33 }));
+  plume.position.z = 2.2;
+  g.add(plume);
+  return g;
+}
+
+class Missile {
+  constructor(type, launchPos, launchQuat, launchVel, target, targetBandit) {
+    this.type = type;
+    this.params = WEAPON_PARAMS[type];
+    this.position = launchPos.clone();
+    this.velocity = launchVel.clone();
+    this.quaternion = launchQuat.clone();
+    this.target = target;
+    this.targetBandit = targetBandit;
+    this.time = 0;
+    this.state = 'BOOST';       // BOOST -> (AIM7M: GUIDED) / (AIM120: MIDCOURSE -> TERMINAL)
+    this.alive = true;
+    this.result = null;         // 'HIT' | 'MISS'
+    this.lastGuidancePoint = target.position.clone();
+    this.mesh = buildMissileMesh(this.params.color);
+    scene.add(this.mesh);
+
+    // Debug guidance line: shows exactly where the missile is currently steering toward.
+    // Same color as the missile's HUD track color so it's easy to tell which shot is which.
+    const lineColor = (type === 'AIM7M') ? 0x5cc7ff : 0xff9c5c;
+    const lineGeo = new THREE.BufferGeometry().setFromPoints([this.position.clone(), this.lastGuidancePoint.clone()]);
+    this.guidanceLine = new THREE.Line(lineGeo, new THREE.LineDashedMaterial({ color: lineColor, dashSize: 40, gapSize: 20, transparent:true, opacity:0.6 }));
+    this.guidanceLine.computeLineDistances();
+    scene.add(this.guidanceLine);
+
+    // Smoke trail: a small ring buffer of recent positions rendered as a fading polyline
+    this.trailPoints = [this.position.clone()];
+    this.trailGeo = new THREE.BufferGeometry();
+    this.trailLine = new THREE.Line(this.trailGeo, new THREE.LineBasicMaterial({ color: 0xdddddd, transparent:true, opacity:0.5 }));
+    scene.add(this.trailLine);
+  }
+
+  // Where the missile *thinks* the target is, given its guidance source.
+  // Uses a simple lead-prediction: aims at where the target will be after the
+  // remaining time-of-flight, not just where it currently is — otherwise the
+  // missile is always chasing a stale position and ends up trailing the target.
+  leadPoint(targetPos) {
+    const targetVel = new THREE.Vector3(0,0,-1)
+      .applyQuaternion(this.target.quaternion)
+      .multiplyScalar(this.target.speed || 0);
+    const range = this.position.distanceTo(targetPos);
+    const closingSpeed = Math.max(this.velocity.length(), 1);
+    const timeToGo = range / closingSpeed;
+    return targetPos.clone().addScaledVector(targetVel, timeToGo);
+  }
+
+  getGuidancePoint() {
+    if (this.type === 'AIM7M') {
+      // SARH: only valid while ownship radar is in STT locked onto this exact target.
+      const stillIlluminated = radar.mode === 'STT' && radar.lockedTrack && radar.lockedTrack.entity === this.target;
+      if (stillIlluminated) this.lastGuidancePoint.copy(this.leadPoint(this.target.position));
+      // if illumination lost, guidance simply stops updating (last point coasts) -> will miss a maneuvering target
+      return this.lastGuidancePoint;
+    } else {
+      // AIM-120
+      const distToTarget = this.position.distanceTo(this.target.position);
+      if (this.state === 'TERMINAL' || distToTarget < this.params.pitbullRange) {
+        this.state = 'TERMINAL';
+        this.lastGuidancePoint.copy(this.leadPoint(this.target.position)); // active seeker: perfect track once pitbull
+      } else {
+        // Midcourse: only updates if ownship radar currently has ANY track on the target (search/TWS/STT)
+        const ownshipHasTrack = radar.tracks.some(t => t.entity === this.target);
+        if (ownshipHasTrack) this.lastGuidancePoint.copy(this.leadPoint(this.target.position));
+        // else: coasts on last datalink update (predicted intercept point goes stale)
+      }
+      return this.lastGuidancePoint;
+    }
+  }
+
+  update(dt) {
+    if (!this.alive) return;
+    this.time += dt;
+    const p = this.params;
+
+    // Boost phase
+    let speed = this.velocity.length();
+    if (this.state === 'BOOST' || (this.type==='AIM120' && this.time < p.boostTime)) {
+      speed = Math.min(speed + p.boostAccel * dt, p.boostSpeedCap);
+      if (this.time >= p.boostTime) {
+        this.state = (this.type === 'AIM7M') ? 'GUIDED' : 'MIDCOURSE';
+      }
+    } else {
+      speed = Math.max(speed - p.dragDecel * dt, 250);
+    }
+
+    // Guidance (proportional navigation) once past boost
+    if (this.time >= p.boostTime) {
+      const aimPoint = this.getGuidancePoint();
+      const losNow = new THREE.Vector3().subVectors(aimPoint, this.position);
+      const range = losNow.length();
+
+      if (!this._losPrev) this._losPrev = losNow.clone();
+      const losDirNow = losNow.clone().normalize();
+      const losDirPrev = this._losPrev.clone().normalize();
+      const losRotAxis = new THREE.Vector3().crossVectors(losDirPrev, losDirNow);
+      const losRotRate = losRotAxis.length() / Math.max(dt, 0.0001);
+      this._losPrev = losNow.clone();
+
+      const closingSpeed = speed + (this.target.speed || 0); // simplified closure estimate
+      const desiredDir = losDirNow.clone();
+      const currentDir = this.velocity.clone().normalize();
+
+      // Pure LOS-rate PN term (correct for a maneuvering target once tracking is established)
+      const pnAccelMag = p.navConstant * closingSpeed * losRotRate;
+
+      // Bearing-error term: pure LOS-rate PN collapses to ~0 when the target is far away and the
+      // angular offset is large-but-slowly-changing (e.g. right after a big off-boresight launch),
+      // so without this term the missile barely corrects until it's already close/too late.
+      // Scales correction with how far off-axis the missile currently is.
+      const bearingError = currentDir.angleTo(desiredDir); // radians
+      const bearingAccelMag = bearingError * closingSpeed * 1.5;
+
+      const navAccelMag = Math.min(pnAccelMag + bearingAccelMag, p.maxG * 9.81);
+
+      // Achievable turn rate (rad/s) from that lateral acceleration, then integrate for this frame
+      const turnRateAvailable = navAccelMag / Math.max(speed, 1);
+      const maxTurnThisFrame = turnRateAvailable * dt;
+      const lerpFrac = bearingError > 1e-6 ? THREE.MathUtils.clamp(maxTurnThisFrame / bearingError, 0, 1) : 0;
+      const newDir = currentDir.clone().lerp(desiredDir, lerpFrac).normalize();
+      this.velocity.copy(newDir.multiplyScalar(speed));
+
+      // Hit check
+      if (range < 20) {
+        this.alive = false;
+        this.result = 'HIT';
+      }
+    } else {
+      this.velocity.setLength(speed);
+    }
+
+    this.position.addScaledVector(this.velocity, dt);
+    this.mesh.position.copy(this.position);
+    if (this.velocity.lengthSq() > 0.01) {
+      const dir = this.velocity.clone().normalize();
+      const m = new THREE.Matrix4().lookAt(new THREE.Vector3(0,0,0), dir.clone().negate(), new THREE.Vector3(0,1,0));
+      this.mesh.quaternion.setFromRotationMatrix(m);
+    }
+
+    // Refresh the guidance line so it always points from the missile's current
+    // position to whatever aimpoint it's steering toward right now.
+    this.guidanceLine.geometry.setFromPoints([this.position.clone(), this.lastGuidancePoint.clone()]);
+    this.guidanceLine.geometry.attributes.position.needsUpdate = true;
+    this.guidanceLine.computeLineDistances();
+
+    // Append to the trail (cap length so it doesn't grow forever)
+    this.trailPoints.push(this.position.clone());
+    if (this.trailPoints.length > 40) this.trailPoints.shift();
+    this.trailGeo.setFromPoints(this.trailPoints);
+
+    // Miss conditions
+    if (this.alive && this.time > p.maxFlightTime) { this.alive = false; this.result = 'MISS (timed out)'; }
+    if (this.alive && this.position.y < 0) { this.alive = false; this.result = 'MISS (ground)'; }
+  }
+
+  destroy() {
+    scene.remove(this.mesh);
+    scene.remove(this.guidanceLine);
+    scene.remove(this.trailLine);
+  }
+}
+
+const activeMissiles = [];
+const killFeed = []; // { text, t, color }
+let lastFiredMissile = null; // most recently launched missile, used for the missile-cam PIP
+
+function feedPush(text, color) {
+  killFeed.unshift({ text, t: 5.0, color: color || '#ffd75c' });
+  if (killFeed.length > 8) killFeed.length = 8;
+}
+// kept for any older call sites; routes into the feed
+function flashMessage(msg) { feedPush(msg); }
+
+function fireWeapon() {
+  const type = selectedWeapon;
+  if (loadout[type].count <= 0) { flashMessage(type + ' — RACK EMPTY'); return; }
+
+  const targetTrack = radar.lockedTrack || (radar.tracks[0] || null);
+  if (!targetTrack) { flashMessage('NO TRACK'); return; }
+
+  if (type === 'AIM7M' && radar.mode !== 'STT') {
+    flashMessage('AIM-7M NEEDS STT LOCK'); return;
+  }
+
+  const launchOffset = new THREE.Vector3(0, -0.8, 3).applyQuaternion(ownShip.quaternion);
+  const launchPos = ownShip.position.clone().add(launchOffset);
+  const forward = new THREE.Vector3(0,0,-1).applyQuaternion(ownShip.quaternion);
+  const launchVel = forward.clone().multiplyScalar(ownShip.speed + 40);
+
+  const m = new Missile(type, launchPos, ownShip.quaternion, launchVel, targetTrack.entity, targetTrack.bandit);
+  activeMissiles.push(m);
+  lastFiredMissile = m;
+  loadout[type].count -= 1;
+  feedPush('FOX ' + (type === 'AIM7M' ? '1' : '3') + ' — ' + type + ' away', '#5cc7ff');
+}
+
+// ---------- HUD / Radar page rendering (2D canvas overlay) ----------
+const hudCanvas = document.getElementById('hud');
+const hctx = hudCanvas.getContext('2d');
+function resizeCanvases() {
+  const w = window.innerWidth, h = window.innerHeight;
+  renderer.setSize(w, h);
+  camera.aspect = w/h; camera.updateProjectionMatrix();
+  hudCanvas.width = w; hudCanvas.height = h;
+}
+window.addEventListener('resize', resizeCanvases);
+resizeCanvases();
+
+const HUD_GREEN = '#5cff5c';
+
+function drawHUD(missileCamRect) {
+  const w = hudCanvas.width, h = hudCanvas.height;
+  hctx.clearRect(0,0,w,h);
+  hctx.strokeStyle = HUD_GREEN;
+  hctx.fillStyle = HUD_GREEN;
+  hctx.lineWidth = 2;
+  hctx.font = '16px Consolas, monospace';
+  hctx.textAlign = 'center';
+
+  const cx = w/2, cy = h/2;
+
+  // --- Heading tape (top) ---
+  hctx.save();
+  hctx.beginPath();
+  hctx.rect(cx-250, 20, 500, 30);
+  hctx.clip();
+  const headingDeg = ((THREE.MathUtils.radToDeg(ownShip.heading) % 360) + 360) % 360;
+  for (let d = -40; d <= 40; d += 5) {
+    const mark = Math.round((headingDeg + d)/5)*5;
+    const x = cx + (mark - headingDeg) * 5;
+    const isMajor = ((mark % 10) === 0);
+    hctx.beginPath();
+    hctx.moveTo(x, 20);
+    hctx.lineTo(x, isMajor ? 36 : 30);
+    hctx.stroke();
+    if (isMajor) {
+      let label = ((mark % 360) + 360) % 360;
+      hctx.fillText(String(label).padStart(3,'0'), x, 50);
+    }
+  }
+  hctx.restore();
+  hctx.beginPath(); hctx.moveTo(cx,20); hctx.lineTo(cx-6,10); hctx.lineTo(cx+6,10); hctx.closePath(); hctx.fill();
+
+  // --- Pitch ladder (center) ---
+  hctx.save();
+  hctx.translate(cx, cy);
+  hctx.rotate(-ownShip.roll);
+  const pitchDeg = THREE.MathUtils.radToDeg(ownShip.pitch);
+  for (let p = -90; p <= 90; p += 10) {
+    if (p === 0) continue;
+    const y = -(p - pitchDeg) * 6;
+    if (Math.abs(y) > 260) continue;
+    const halfW = p > 0 ? 60 : 40;
+    hctx.beginPath();
+    hctx.moveTo(-halfW, y); hctx.lineTo(halfW, y);
+    if (p < 0) { hctx.setLineDash([6,6]); } else { hctx.setLineDash([]); }
+    hctx.stroke();
+    hctx.setLineDash([]);
+    hctx.textAlign = 'right';
+    hctx.fillText(String(Math.abs(p)), -halfW-10, y+5);
+    hctx.textAlign = 'left';
+    hctx.fillText(String(Math.abs(p)), halfW+10, y+5);
+  }
+  // Horizon line
+  hctx.beginPath(); hctx.moveTo(-90,0); hctx.lineTo(-20,0); hctx.moveTo(20,0); hctx.lineTo(90,0); hctx.stroke();
+  hctx.restore();
+
+  // Waterline / boresight symbol (fixed to airframe, not horizon)
+  hctx.beginPath();
+  hctx.moveTo(cx-20, cy); hctx.lineTo(cx-6, cy);
+  hctx.moveTo(cx+6, cy); hctx.lineTo(cx+20, cy);
+  hctx.moveTo(cx, cy-6); hctx.lineTo(cx, cy+6);
+  hctx.stroke();
+
+  // --- Airspeed tape (left) ---
+  hctx.textAlign = 'right';
+  const spdKts = Math.round(ownShip.speed * 1.94384);
+  hctx.font = '22px Consolas, monospace';
+  hctx.fillText(String(spdKts), cx-220, cy+8);
+  hctx.font = '12px Consolas, monospace';
+  hctx.fillText('KTS', cx-220, cy+24);
+  hctx.strokeRect(cx-280, cy-16, 66, 32);
+
+  // --- Altitude tape (right) ---
+  hctx.textAlign = 'left';
+  const altFt = Math.round(ownShip.position.y * 3.28084);
+  hctx.font = '22px Consolas, monospace';
+  hctx.fillText(String(altFt), cx+220, cy+8);
+  hctx.font = '12px Consolas, monospace';
+  hctx.fillText('FT', cx+220, cy+24);
+  hctx.strokeRect(cx+214, cy-16, 66, 32);
+
+  // --- Throttle readout ---
+  hctx.textAlign = 'left';
+  hctx.font = '14px Consolas, monospace';
+  hctx.fillText('THR ' + Math.round(ownShip.throttle*100) + '%', cx-280, cy+60);
+
+  // --- Weapon / radar mode status (top right) ---
+  hctx.textAlign = 'right';
+  hctx.font = '16px Consolas, monospace';
+  hctx.fillText('RDR: ' + radar.mode, w-20, 40);
+  hctx.fillStyle = radar.mode === 'STT' ? '#ff5c5c' : HUD_GREEN;
+  hctx.fillText(radar.mode === 'STT' ? 'LOCK' : (radar.tracks.length ? 'CONTACT' : 'CLEAR'), w-20, 60);
+  hctx.fillStyle = HUD_GREEN;
+
+  // --- Radar scope (bottom right): top-down, own-ship-centered, forward up ---
+  const scopeR = 150;
+  const scx = w - scopeR - 30, scy = h - scopeR - 30;
+  hctx.save();
+  hctx.beginPath();
+  hctx.arc(scx, scy, scopeR, 0, Math.PI*2);
+  hctx.stroke();
+  // Azimuth gimbal wedge
+  hctx.beginPath();
+  hctx.moveTo(scx, scy);
+  hctx.arc(scx, scy, scopeR, -Math.PI/2 - radar.azimuthLimit, -Math.PI/2 + radar.azimuthLimit);
+  hctx.closePath();
+  hctx.globalAlpha = 0.12;
+  hctx.fill();
+  hctx.globalAlpha = 1;
+  // Range rings
+  for (let r = 1; r <= 3; r++) {
+    hctx.beginPath();
+    hctx.arc(scx, scy, scopeR * r/3, 0, Math.PI*2);
+    hctx.globalAlpha = 0.35;
+    hctx.stroke();
+    hctx.globalAlpha = 1;
+  }
+  hctx.font = '10px Consolas, monospace';
+  hctx.textAlign = 'left';
+  hctx.fillText((radar.maxRangeHeadOn/1000/3*1).toFixed(0)+'nmi', scx+4, scy-scopeR/3+12);
+  hctx.fillText((radar.maxRangeHeadOn/1000/3*3*0.539957/3*1).toFixed(0), scx+4, scy-scopeR+12);
+  // Own ship marker
+  hctx.beginPath(); hctx.moveTo(scx, scy-6); hctx.lineTo(scx-4, scy+4); hctx.lineTo(scx+4, scy+4); hctx.closePath();
+  hctx.fill();
+
+  // Contacts
+  const scopeRangeMax = radar.maxRangeHeadOn;
+  radar.tracks.forEach(tr => {
+    const rr = Math.min(tr.range / scopeRangeMax, 1) * scopeR;
+    const ang = tr.azimuth; // 0 = up (forward)
+    const px = scx + Math.sin(ang) * rr;
+    const py = scy - Math.cos(ang) * rr;
+    hctx.fillStyle = radar.mode === 'STT' ? '#ff5c5c' : '#ffd75c';
+    hctx.beginPath();
+    if (radar.mode === 'STT') {
+      hctx.arc(px, py, 5, 0, Math.PI*2); hctx.fill();
+      hctx.strokeStyle = '#ff5c5c';
+      hctx.beginPath(); hctx.arc(px, py, 9, 0, Math.PI*2); hctx.stroke();
+    } else {
+      hctx.rect(px-4, py-4, 8, 8); hctx.fill();
+    }
+    hctx.fillStyle = HUD_GREEN;
+    hctx.strokeStyle = HUD_GREEN;
+  });
+  hctx.restore();
+
+  hctx.textAlign = 'left';
+  hctx.font = '11px Consolas, monospace';
+  hctx.fillText('AZ ±60', scx - scopeR, scy + scopeR + 14);
+
+  // --- Screen-space target boxes over visually-tracked contacts ---
+  radar.tracks.forEach(tr => {
+    const isLocked = radar.lockedTrack && radar.lockedTrack.entity === tr.entity;
+    const worldPos = tr.entity.position.clone();
+    const proj = worldPos.project(camera);
+    if (proj.z > 1 || proj.z < -1) return; // behind camera
+    const sx = (proj.x * 0.5 + 0.5) * w;
+    const sy = (1 - (proj.y * 0.5 + 0.5)) * h;
+    // Box size scales down with range so it feels like a real sensor cue, clamped so it stays visible
+    const boxSize = THREE.MathUtils.clamp(4000 / (tr.range/100), 14, 70);
+    hctx.strokeStyle = isLocked ? '#ff5c5c' : '#ffd75c';
+    hctx.lineWidth = isLocked ? 2 : 1;
+    hctx.strokeRect(sx - boxSize/2, sy - boxSize/2, boxSize, boxSize);
+    if (isLocked) {
+      // corner tick marks for a "locked" look
+      const tick = 6;
+      hctx.beginPath();
+      hctx.moveTo(sx-boxSize/2-tick, sy-boxSize/2); hctx.lineTo(sx-boxSize/2, sy-boxSize/2);
+      hctx.moveTo(sx+boxSize/2, sy-boxSize/2); hctx.lineTo(sx+boxSize/2+tick, sy-boxSize/2);
+      hctx.moveTo(sx-boxSize/2-tick, sy+boxSize/2); hctx.lineTo(sx-boxSize/2, sy+boxSize/2);
+      hctx.moveTo(sx+boxSize/2, sy+boxSize/2); hctx.lineTo(sx+boxSize/2+tick, sy+boxSize/2);
+      hctx.stroke();
+    }
+    hctx.font = '10px Consolas, monospace';
+    hctx.fillStyle = isLocked ? '#ff5c5c' : '#ffd75c';
+    hctx.textAlign = 'left';
+    hctx.fillText((tr.range/1852).toFixed(1)+'nmi', sx + boxSize/2 + 4, sy);
+    hctx.strokeStyle = HUD_GREEN;
+    hctx.fillStyle = HUD_GREEN;
+    hctx.lineWidth = 2;
+  });
+
+  // --- Weapon status (below radar mode, top right) ---
+  hctx.textAlign = 'right';
+  hctx.font = '14px Consolas, monospace';
+  hctx.fillText('SEL ' + selectedWeapon + '  x' + loadout[selectedWeapon].count, w-20, 90);
+  hctx.font = '11px Consolas, monospace';
+  hctx.fillText('AIM-7M x' + loadout.AIM7M.count + '   AIM-120 x' + loadout.AIM120.count, w-20, 108);
+
+  // Simplified in-range cue: rough Rmax scaling with closure + aspect, just for a shot-quality hint
+  if (radar.tracks.length) {
+    const tr = radar.tracks[0];
+    const closureBonus = THREE.MathUtils.clamp(tr.closureRate / 300, -0.5, 0.5);
+    const rmax = (selectedWeapon === 'AIM7M' ? 22000 : 40000) * (0.6 + tr.quality*0.4 + closureBonus);
+    const inRange = tr.range < rmax;
+    hctx.fillStyle = inRange ? '#5cff5c' : '#ff9c5c';
+    hctx.fillText((inRange ? 'IN RANGE' : 'RMAX ~' + (rmax/1852).toFixed(0)+'nmi'), w-20, 126);
+    hctx.fillStyle = HUD_GREEN;
+  }
+
+  // --- Active missiles in flight ---
+  if (activeMissiles.length) {
+    hctx.textAlign = 'left';
+    hctx.font = '12px Consolas, monospace';
+    activeMissiles.forEach((m, i) => {
+      const rangeToTarget = m.position.distanceTo(m.target.position);
+      hctx.fillText(m.type + ' TOF ' + m.time.toFixed(1) + 's  ' + m.state + '  RNG ' + (rangeToTarget/1852).toFixed(1) + 'nmi',
+        20, 30 + i*16);
+    });
+  }
+
+  // --- Kill feed: stacked recent events, top-center, newest on top, fading out ---
+  if (killFeed.length) {
+    hctx.textAlign = 'right';
+    hctx.font = '15px Consolas, monospace';
+    killFeed.forEach((f, i) => {
+      const alpha = Math.min(1, f.t / 1.0); // fade out over the last second of its life
+      hctx.globalAlpha = alpha;
+      hctx.fillStyle = f.color;
+      hctx.fillText(f.text, w - 20, 160 + i * 18);
+    });
+    hctx.globalAlpha = 1;
+    hctx.fillStyle = HUD_GREEN;
+  }
+
+  // --- Contact data block (bottom left) if any track present ---
+  if (radar.tracks.length) {
+    const tr = radar.lockedTrack || radar.tracks[0];
+    hctx.textAlign = 'left';
+    hctx.font = '13px Consolas, monospace';
+    const lines = [
+      'CONTACTS: ' + radar.tracks.length + (radar.lockedTrack ? '  (LOCKED)' : ''),
+      'RNG  ' + (tr.range/1852).toFixed(1) + ' nmi',
+      'AZ   ' + THREE.MathUtils.radToDeg(tr.azimuth).toFixed(0) + ' deg',
+      'ASP  ' + THREE.MathUtils.radToDeg(tr.aspect).toFixed(0) + ' deg',
+      'CLSR ' + tr.closureRate.toFixed(0) + ' m/s',
+      'ALT  ' + Math.round(tr.entity.position.y*3.28084) + ' ft',
+    ];
+    lines.forEach((l,i) => hctx.fillText(l, 20, h-140+i*18));
+  }
+
+  // --- Missile cam PIP border/label + tracked-plane box inside it ---
+  if (missileCamRect) {
+    const { vx, viewportYFromTop, w: mw, h: mh } = missileCamRect;
+    const m = lastFiredMissile;
+
+    // Target box, projected using the missile's own camera so it lines up with what's actually rendered in the PIP
+    if (m && m.target && m.target.position) {
+      const worldPos = m.target.position.clone();
+      const proj = worldPos.project(missileCamera);
+      if (proj.z >= -1 && proj.z <= 1) {
+        const sx = vx + (proj.x * 0.5 + 0.5) * mw;
+        const sy = viewportYFromTop + (1 - (proj.y * 0.5 + 0.5)) * mh;
+        if (sx >= vx && sx <= vx + mw && sy >= viewportYFromTop && sy <= viewportYFromTop + mh) {
+          const range = m.position.distanceTo(m.target.position);
+          const boxSize = THREE.MathUtils.clamp(3000 / (range/100), 8, 40);
+          hctx.strokeStyle = '#ff5c5c';
+          hctx.lineWidth = 1.5;
+          hctx.strokeRect(sx - boxSize/2, sy - boxSize/2, boxSize, boxSize);
+          hctx.font = '9px Consolas, monospace';
+          hctx.fillStyle = '#ff5c5c';
+          hctx.textAlign = 'left';
+          hctx.fillText((range/1852).toFixed(1)+'nmi', sx + boxSize/2 + 3, sy);
+        }
+      }
+    }
+
+    hctx.strokeStyle = '#ff5c5c';
+    hctx.lineWidth = 2;
+    hctx.strokeRect(vx, viewportYFromTop, mw, mh);
+    hctx.fillStyle = '#ff5c5c';
+    hctx.textAlign = 'left';
+    hctx.font = '11px Consolas, monospace';
+    hctx.fillText('MSL CAM — ' + lastFiredMissile.type + '  TOF ' + lastFiredMissile.time.toFixed(1) + 's',
+      vx + 4, viewportYFromTop + 14);
+    hctx.strokeStyle = HUD_GREEN;
+    hctx.fillStyle = HUD_GREEN;
+  }
+}
+
+// ---------- Camera (chase view) ----------
+function updateCamera() {
+  camera.position.copy(ownShip.position);
+  const lookTarget = ownShip.position.clone().add(new THREE.Vector3(0,0,-1).applyQuaternion(ownShip.quaternion).multiplyScalar(20));
+  camera.up.copy(new THREE.Vector3(0,1,0).applyQuaternion(ownShip.quaternion));
+  camera.lookAt(lookTarget);
+}
+
+// ---------- Missile cam (PIP view riding the most recently fired missile) ----------
+const missileCamera = new THREE.PerspectiveCamera(65, 1, 0.5, 60000);
+const MISSILE_CAM_W = 220, MISSILE_CAM_H = 140, MISSILE_CAM_MARGIN = 20;
+const RADAR_SCOPE_R = 150, RADAR_SCOPE_MARGIN = 30; // must match the values used to draw the radar scope in drawHUD
+
+function renderMissileCam() {
+  const m = lastFiredMissile;
+  if (!m || !m.alive) return false;
+
+  // Hide the missile's own mesh so we're not staring at the inside of it from point-blank range
+  m.mesh.visible = false;
+
+  const dir = m.velocity.lengthSq() > 0.01 ? m.velocity.clone().normalize() : new THREE.Vector3(0,0,-1);
+  missileCamera.position.copy(m.position);
+  missileCamera.up.set(0,1,0);
+  missileCamera.lookAt(m.position.clone().add(dir));
+  missileCamera.aspect = MISSILE_CAM_W / MISSILE_CAM_H;
+  missileCamera.updateProjectionMatrix();
+
+  const w = hudCanvas.width, h = hudCanvas.height;
+  const vx = w - MISSILE_CAM_W - MISSILE_CAM_MARGIN;
+  // Sit just above the radar scope circle (scope top edge = h - 2*RADAR_SCOPE_R - RADAR_SCOPE_MARGIN)
+  const radarScopeTop = h - 2*RADAR_SCOPE_R - RADAR_SCOPE_MARGIN;
+  const topFromTop = radarScopeTop - MISSILE_CAM_H - MISSILE_CAM_MARGIN;
+  const viewportY = h - topFromTop - MISSILE_CAM_H; // convert to bottom-left-origin viewport coords
+
+  renderer.setScissorTest(true);
+  renderer.setViewport(vx, viewportY, MISSILE_CAM_W, MISSILE_CAM_H);
+  renderer.setScissor(vx, viewportY, MISSILE_CAM_W, MISSILE_CAM_H);
+  renderer.clearDepth();
+  renderer.render(scene, missileCamera);
+
+  // Restore full-screen viewport/scissor for the main render
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, w, h);
+
+  m.mesh.visible = true;
+
+  return { vx, viewportYFromTop: topFromTop, w: MISSILE_CAM_W, h: MISSILE_CAM_H };
+}
+
+// ---------- Main loop ----------
+let last = performance.now();
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min((now - last)/1000, 0.1);
+  last = now;
+
+  ownShip.update(dt, readControls());
+  bandits.forEach(b => {
+    if (!b.destroyed) {
+      updateBanditScript(b, dt);
+    } else {
+      b.respawnTimer -= dt;
+      if (b.respawnTimer <= 0) respawnBandit(b);
+    }
+    b.mesh.position.copy(b.aircraft.position);
+    b.mesh.quaternion.copy(b.aircraft.quaternion);
+    b.mesh.visible = !b.destroyed;
+  });
+  updateRadar(dt);
+
+  ownJetMesh.position.copy(ownShip.position);
+  ownJetMesh.quaternion.copy(ownShip.quaternion);
+
+  for (let i = activeMissiles.length - 1; i >= 0; i--) {
+    const m = activeMissiles[i];
+    const prevState = m.state;
+    m.update(dt);
+    if (m.alive && m.state === 'TERMINAL' && prevState !== 'TERMINAL') {
+      feedPush(m.type + ' — PITBULL (active seeker)', '#ff9c5c');
+    }
+    if (!m.alive) {
+      if (m.result === 'HIT') {
+        feedPush(m.type + ' — SPLASH 1', '#5cff5c');
+        if (m.targetBandit) {
+          m.targetBandit.destroyed = true;
+          m.targetBandit.respawnTimer = RESPAWN_DELAY;
+        }
+      } else {
+        feedPush(m.type + ' — ' + m.result, '#ff5c5c');
+      }
+      m.destroy();
+      activeMissiles.splice(i, 1);
+    }
+  }
+  killFeed.forEach(f => f.t -= dt);
+  while (killFeed.length && killFeed[killFeed.length-1].t <= 0) killFeed.pop();
+
+  updateCamera();
+  renderer.render(scene, camera);
+  const missileCamRect = renderMissileCam();
+  drawHUD(missileCamRect);
+}
+animate();
+</script>
+</body>
+</html>
