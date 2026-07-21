@@ -1,6 +1,7 @@
 # Air Combat Radar & Missile Guidance Sim
 
 A browser-based air-to-air combat simulation built with Three.js. Fly, get radar locks, and fire guided missiles at AI targets.
+**[Live Demo](https://itsrickyboi.github.io/Radar-Missile-Simulation/)**
 
 ## Features
 
