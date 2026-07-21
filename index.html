@@ -78,7 +78,7 @@ scene.add(ownJetMesh);
 
 // ---------- Flight model (simplified 6DOF-ish, coordinated turns) ----------
 class Aircraft {
-  constructor({ position, heading, speed }) {
+  constructor({ position, heading, speed, maxG }) {
     this.position = position.clone();
     this.heading = heading;      // radians, 0 = +Z (north-ish in our convention)
     this.pitch = 0;
@@ -87,6 +87,8 @@ class Aircraft {
     this.throttle = 0.6;         // 0..1.2 (afterburner headroom)
     this.maxSpeed = 620;         // ~Mach 1.8 at altitude, simplified
     this.minSpeed = 90;
+    this.maxG = maxG || 9;       // structural/pilot G-limit, real fighters ~9G
+    this.currentG = 1;           // last computed load factor, exposed for HUD/debug
     this.quaternion = new THREE.Quaternion();
   }
 
@@ -106,9 +108,16 @@ class Aircraft {
       this.throttle += controls.throttle * 0.6 * dt;
       this.throttle = THREE.MathUtils.clamp(this.throttle, 0, 1.2);
 
-      // Coordinated turn: bank angle drives heading rate (standard flight-sim approximation)
-      const turnRate = Math.sin(this.roll) * 9.81 / Math.max(this.speed, 40) * 1.6;
-      this.heading += turnRate * dt;
+      // Coordinated turn physics: bank angle -> load factor n = 1/cos(bank), then
+      // turn rate omega = g*sqrt(n^2 - 1) / V. This is capped at this.maxG so a jet
+      // can't instantaneously pull a 20G turn just because it's slow and banked hard —
+      // real airframes/pilots black out or the wings come off well before that.
+      const g = 9.81;
+      const rawN = 1 / Math.max(Math.cos(this.roll), 0.05); // load factor implied by bank angle
+      const n = Math.min(rawN, this.maxG);
+      this.currentG = n;
+      const omega = g * Math.sqrt(Math.max(n*n - 1, 0)) / Math.max(this.speed, 40);
+      this.heading += Math.sign(this.roll) * omega * dt;
 
       // Rudder adds slow yaw independent of bank (adverse yaw / slip, simplified)
       this.heading += controls.yaw * yawRate * dt;
@@ -133,7 +142,7 @@ class Aircraft {
   }
 }
 
-const ownShip = new Aircraft({ position: new THREE.Vector3(0, 3000, 0), heading: 0, speed: 260 });
+const ownShip = new Aircraft({ position: new THREE.Vector3(0, 3000, 0), heading: 0, speed: 260, maxG: 9 });
 
 // Scripted bandits: each flies a long racetrack pattern with a gentle S-turn.
 // Multiple independent contacts, each respawns individually after being splashed.
@@ -144,7 +153,7 @@ function makeBandit(spawnBearing, spawnRange) {
     new THREE.Vector3(Math.sin(spawnBearing)*spawnRange, (Math.random()-0.5)*1500, -Math.cos(spawnBearing)*spawnRange)
   );
   spawnPos.y = Math.max(spawnPos.y, 1500);
-  const ac = new Aircraft({ position: spawnPos, heading: spawnBearing + Math.PI, speed: 220 + Math.random()*60 });
+  const ac = new Aircraft({ position: spawnPos, heading: spawnBearing + Math.PI, speed: 220 + Math.random()*60, maxG: 7.5 });
   return {
     aircraft: ac,
     mesh: buildPlaceholder(0x7a3030),
@@ -174,8 +183,27 @@ function respawnBandit(b) {
 
 function updateBanditScript(b, dt) {
   b.scriptT += dt;
-  const turnInput = Math.sin(b.scriptT * b.scriptFreq) * 0.5;
-  b.aircraft.update(dt, { pitch: 0, roll: turnInput, yaw: 0, throttle: 0 });
+
+  // Is anything currently guiding on this bandit? If so, break hard instead of
+  // flying the lazy scripted pattern — a real pilot doesn't hold a gentle S-turn
+  // once RWR lights up or they visually pick up a missile in the air.
+  const threat = activeMissiles.find(m => m.alive && m.target === b.aircraft);
+
+  if (threat) {
+    // Defensive break: roll hard away from the threat's line-of-sight and pull max G,
+    // classic "break turn" — bleeds energy but maximizes angular rate to force an overshoot.
+    const losToThreat = threat.position.clone().sub(b.aircraft.position).normalize();
+    const rightVec = new THREE.Vector3(1,0,0).applyQuaternion(b.aircraft.quaternion);
+    const sideSign = rightVec.dot(losToThreat) >= 0 ? -1 : 1; // break away from the threat's side
+    // Ground avoidance overrides the break's nose-down bias — a real pilot pulls up hard
+    // rather than task-fixate on the missile all the way into the terrain.
+    const lowAltitude = b.aircraft.position.y < 1000;
+    const pitchCmd = lowAltitude ? 0.8 : -0.3;
+    b.aircraft.update(dt, { pitch: pitchCmd, roll: sideSign * 1.5, yaw: 0, throttle: 1 });
+  } else {
+    const turnInput = Math.sin(b.scriptT * b.scriptFreq) * 0.5;
+    b.aircraft.update(dt, { pitch: 0, roll: turnInput, yaw: 0, throttle: 0 });
+  }
 }
 
 // ---------- Controls ----------
@@ -385,34 +413,51 @@ class Missile {
   // Uses a simple lead-prediction: aims at where the target will be after the
   // remaining time-of-flight, not just where it currently is — otherwise the
   // missile is always chasing a stale position and ends up trailing the target.
-  leadPoint(targetPos) {
-    const targetVel = new THREE.Vector3(0,0,-1)
-      .applyQuaternion(this.target.quaternion)
-      .multiplyScalar(this.target.speed || 0);
+  leadPoint(targetPos, targetVel) {
     const range = this.position.distanceTo(targetPos);
     const closingSpeed = Math.max(this.velocity.length(), 1);
     const timeToGo = range / closingSpeed;
     return targetPos.clone().addScaledVector(targetVel, timeToGo);
   }
 
+  currentTargetVel() {
+    return new THREE.Vector3(0,0,-1).applyQuaternion(this.target.quaternion).multiplyScalar(this.target.speed || 0);
+  }
+
+  // Dead-reckon the target forward from the last moment we actually had a track/illumination
+  // on it, using its last known velocity — this is what real INS-aided midcourse guidance does
+  // during brief datalink/illumination gaps, instead of the aimpoint just freezing in place.
+  updateTrackedEstimate(haveTrack) {
+    if (haveTrack) {
+      this.lastKnownPos = this.target.position.clone();
+      this.lastKnownVel = this.currentTargetVel();
+      this.lastTrackTime = this.time;
+      this.lastGuidancePoint.copy(this.leadPoint(this.lastKnownPos, this.lastKnownVel));
+    } else if (this.lastKnownPos) {
+      const gap = this.time - this.lastTrackTime;
+      const deadReckonedPos = this.lastKnownPos.clone().addScaledVector(this.lastKnownVel, gap);
+      this.lastGuidancePoint.copy(this.leadPoint(deadReckonedPos, this.lastKnownVel));
+    }
+    // (if we've never had a track at all yet, lastGuidancePoint keeps its initial value)
+  }
+
   getGuidancePoint() {
     if (this.type === 'AIM7M') {
       // SARH: only valid while ownship radar is in STT locked onto this exact target.
       const stillIlluminated = radar.mode === 'STT' && radar.lockedTrack && radar.lockedTrack.entity === this.target;
-      if (stillIlluminated) this.lastGuidancePoint.copy(this.leadPoint(this.target.position));
-      // if illumination lost, guidance simply stops updating (last point coasts) -> will miss a maneuvering target
+      this.updateTrackedEstimate(stillIlluminated);
       return this.lastGuidancePoint;
     } else {
       // AIM-120
       const distToTarget = this.position.distanceTo(this.target.position);
       if (this.state === 'TERMINAL' || distToTarget < this.params.pitbullRange) {
         this.state = 'TERMINAL';
-        this.lastGuidancePoint.copy(this.leadPoint(this.target.position)); // active seeker: perfect track once pitbull
+        this.lastGuidancePoint.copy(this.leadPoint(this.target.position, this.currentTargetVel())); // active seeker: perfect track once pitbull
       } else {
-        // Midcourse: only updates if ownship radar currently has ANY track on the target (search/TWS/STT)
+        // Midcourse: updates directly if ownship radar currently has ANY track on the target
+        // (search/TWS/STT); otherwise dead-reckons from the last known state instead of freezing.
         const ownshipHasTrack = radar.tracks.some(t => t.entity === this.target);
-        if (ownshipHasTrack) this.lastGuidancePoint.copy(this.leadPoint(this.target.position));
-        // else: coasts on last datalink update (predicted intercept point goes stale)
+        this.updateTrackedEstimate(ownshipHasTrack);
       }
       return this.lastGuidancePoint;
     }
